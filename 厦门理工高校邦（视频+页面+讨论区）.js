@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         高校邦全自动刷课+讨论（增强轮询版）
-// @namespace    https://github.com/yourname/gaoxiaobang
+// @namespace    https://github.com/Wu557666/gaoxiaobang
 // @version      2.2.0
 // @description  跳转后主动轮询检测讨论区，超时提示，完成醒目提示
 // @match        https://xmut.class.gaoxiaobang.com/*
