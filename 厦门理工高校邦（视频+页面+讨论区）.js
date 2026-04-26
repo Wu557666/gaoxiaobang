@@ -1,8 +1,10 @@
 // ==UserScript==
-// @name         高校邦全自动刷课+讨论（增强轮询版）
+// @name         厦门理工高校邦刷课脚本
 // @namespace    https://github.com/Wu557666/gaoxiaobang
-// @version      2.2.0
-// @description  跳转后主动轮询检测讨论区，超时提示，完成醒目提示
+// @version      2.3.8
+// @description  刷视频/页面+讨论批量回复，已抑制无影响的 JSON 和视频错误
+// @author       wu某人 (优化 by Assistant)
+// @icon         https://favicon.im/xmut.gaoxiaobang.com?size=128
 // @match        https://xmut.class.gaoxiaobang.com/*
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -14,14 +16,26 @@
 (function() {
     'use strict';
 
+    // --- 可选：抑制平台无关错误（保持控制台清爽）---
+    const originalConsoleError = console.error;
+    console.error = function(...args) {
+        const msg = args.join(' ');
+        if (msg.includes('JSON.parse error') ||
+            msg.includes('MEDIA_ERR_SRC_NOT_SUPPORTED') ||
+            msg.includes('Failed to load resource')) {
+            return;
+        }
+        originalConsoleError.apply(console, args);
+    };
+
     const $ = unsafeWindow.$ || window.$;
     const wait = ms => new Promise(r => setTimeout(r, ms));
     const STATE_KEY = 'gb_auto_step';
+    const PROCESSED_TOPICS_KEY = 'gb_processed_topics';
 
     const isChapterPage = !!(unsafeWindow.classinfo?.classId && (unsafeWindow.unitList || unsafeWindow.chapterList));
     const isDiscussPage = () => !!document.querySelector('a[content_type="Topic"]');
 
-    // 全局标记，防止重复执行讨论
     let discussRunning = false;
 
     // ========== 第一部分：刷进度 ==========
@@ -65,11 +79,19 @@
             $.ajax({
                 url: `${urlPrefix}/class/${classId}/chapter/${chapter.chapterId}/api`,
                 type: 'GET',
+                dataType: 'text',
                 success: result => {
-                    const seconds = (result.chapter?.video?.seconds) || 0;
+                    let seconds = 0;
+                    try {
+                        const data = JSON.parse(result);
+                        seconds = (data.chapter?.video?.seconds) || 0;
+                    } catch (e) {
+                        console.warn(`⚠️ 视频 ${chapter.chapterId} 数据解析失败，按0秒处理`);
+                    }
                     $.ajax({
                         url: `${urlPrefix}/log/video/${chapter.chapterId}/${classId}/api`,
                         type: 'POST',
+                        dataType: 'text',
                         data: { data: JSON.stringify([{ state: "listening", level: 2, ch: seconds, mh: 0 }]) },
                         success: () => { console.log(`✅ 视频 ${chapter.chapterId} 上报成功`); resolve(); },
                         error: xhr => { console.error(`❌ 视频 ${chapter.chapterId} 上报失败 (${xhr.status})`); resolve(); }
@@ -84,6 +106,7 @@
             $.ajax({
                 url: `${urlPrefix}/class/${classId}/chapter/${chapter.chapterId}/api?${Date.now()}`,
                 type: 'GET',
+                dataType: 'text',
                 success: () => console.log(`🟢 页面 ${chapter.chapterId} GET成功 (${index+1}/${pageChapters.length})`),
                 error: xhr => console.warn(`🔴 页面 ${chapter.chapterId} GET失败 (${xhr.status})，但可能仍有效`)
             });
@@ -94,10 +117,8 @@
         console.log('%c✅ 进度刷取完成，立即跳转讨论区', 'color:green;font-size:14px');
         GM_setValue(STATE_KEY, 'discuss');
 
-        // 开始主动轮询检测讨论区
         startPollingForDiscuss();
 
-        // 跳转
         const firstTopic = document.querySelector('a[content_type="Topic"]');
         if (firstTopic) {
             const chapterId = firstTopic.getAttribute('chapter_id');
@@ -116,7 +137,7 @@
     // ========== 主动轮询检测讨论区 ==========
     let pollingTimer = null;
     let pollStartTime = null;
-    const POLL_TIMEOUT = 15000; // 15秒超时
+    const POLL_TIMEOUT = 15000;
 
     function startPollingForDiscuss() {
         if (pollingTimer) clearInterval(pollingTimer);
@@ -129,7 +150,6 @@
                 return;
             }
 
-            // 检测到讨论区元素且未在执行
             if (isDiscussPage() && !discussRunning) {
                 clearInterval(pollingTimer);
                 console.log('%c🔔 检测到讨论区已加载，继续执行第二步...', 'color:#1fb6ff;font-size:14px');
@@ -137,10 +157,9 @@
                 return;
             }
 
-            // 超时提示
             if (Date.now() - pollStartTime > POLL_TIMEOUT) {
                 clearInterval(pollingTimer);
-                console.warn('%c⚠️ 等待讨论区加载超时！请手动在控制台输入 autoContinue() 继续，或刷新页面。', 'color:orange;font-size:14px');
+                console.warn('%c⚠️ 等待讨论区加载超时！请手动在控制台输入 autoContinue() 继续。', 'color:orange;font-size:14px');
                 window.autoContinue = async () => {
                     if (isDiscussPage() && !discussRunning) {
                         await runDiscuss();
@@ -158,19 +177,49 @@
         if (discussRunning) return;
         discussRunning = true;
 
-        console.log('%c💬 第二步：开始批量评论', 'color:#1fb6ff;font-size:16px');
+        console.log('%c💬 第二步：开始批量评论（支持断点续传）', 'color:#1fb6ff;font-size:16px');
+
+        function getProcessedTopicIds() {
+            const stored = GM_getValue(PROCESSED_TOPICS_KEY, '[]');
+            try { return JSON.parse(stored); } catch(e) { return []; }
+        }
+
+        function markTopicAsProcessed(chapterId) {
+            const ids = getProcessedTopicIds();
+            if (!ids.includes(chapterId)) {
+                ids.push(chapterId);
+                GM_setValue(PROCESSED_TOPICS_KEY, JSON.stringify(ids));
+            }
+        }
+
+        function clearProcessedTopics() {
+            GM_deleteValue(PROCESSED_TOPICS_KEY);
+        }
 
         const Editor = {
             getUEditor() {
                 const UE = unsafeWindow.UE || window.UE;
-                if (!UE?.instants) return null;
-                return Object.values(UE.instants).find(i => i?.setContent);
+                if (UE?.instants) {
+                    const inst = Object.values(UE.instants).find(i => i && i.setContent);
+                    if (inst) return inst;
+                }
+                if (UE && typeof UE.getEditor === 'function') {
+                    const inst = UE.getEditor('ueditor');
+                    if (inst && inst.setContent) return inst;
+                }
+                if (UE && UE.instants) {
+                    for (let k in UE.instants) {
+                        if (UE.instants[k] && UE.instants[k].setContent) return UE.instants[k];
+                    }
+                }
+                return null;
             },
             setContent(content) {
                 const ue = this.getUEditor();
                 if (ue) {
                     ue.setContent(content);
                     try { ue.fireEvent('contentChange'); } catch(e) {}
+                    console.log('  ✅ 通过 UEditor API 填入');
                     return true;
                 }
                 const iframe = document.querySelector('iframe[id^="ueditor_"]');
@@ -181,6 +230,7 @@
                         if (body) {
                             body.innerHTML = `<p>${content.replace(/\n/g, '</p><p>')}</p>`;
                             body.dispatchEvent(new Event('input', { bubbles: true }));
+                            console.log('  ✅ 通过 iframe body 填入');
                             return true;
                         }
                     } catch(e) {}
@@ -191,41 +241,41 @@
                 const texts = [];
                 document.querySelectorAll('.reply-content').forEach(el => {
                     const p = el.querySelector('p');
-                    const text = (p ? p.innerText : el.innerText).trim();
+                    const text = p ? p.innerText.trim() : el.innerText.trim();
                     if (text) texts.push(text);
                 });
                 if (!texts.length) {
-                    document.querySelectorAll('.reply-content-container').forEach(el => {
-                        const text = el.innerText.replace(/.*回复/g, '').trim();
+                    document.querySelectorAll('.reply-content-container .reply-content').forEach(el => {
+                        const p = el.querySelector('p');
+                        const text = p ? p.innerText.trim() : el.innerText.trim();
                         if (text) texts.push(text);
                     });
                 }
-                return texts.length ? texts.reduce((a,b) => a.length>b.length?a:b) : '';
+                return texts.length ? texts.reduce((a, b) => a.length > b.length ? a : b) : '';
+            },
+            hasSubmitted() {
+                const editBtn = document.querySelector('i.post-submit-edit');
+                if (!editBtn) return false;
+                return editBtn.offsetParent !== null && window.getComputedStyle(editBtn).display !== 'none';
             },
             findReplyBtn() {
-                const replyBtn = document.querySelector('i.post-submit');
-                if (replyBtn && replyBtn.innerText.trim() === '回复') return replyBtn;
-                return Array.from(document.querySelectorAll('i, button, .btn')).find(el => {
+                const candidates = document.querySelectorAll('i.post-submit, i, button, .btn');
+                for (let el of candidates) {
                     const text = el.innerText.trim();
-                    return text === '回复' || (text.includes('回复') && !text.includes('编辑'));
-                });
+                    if ((text === '回复' || text.includes('回复')) && !text.includes('编辑')) {
+                        if (el.offsetParent !== null && window.getComputedStyle(el).display !== 'none') {
+                            return el;
+                        }
+                    }
+                }
+                return null;
             },
             enableButton(btn) {
                 if (!btn) return;
                 btn.classList.remove('disabled', 'btn-disabled', 'ban-click');
                 btn.style.pointerEvents = 'auto';
                 btn.style.opacity = '1';
-            },
-            async waitForSuccess() {
-                const start = Date.now();
-                while (Date.now() - start < 8000) {
-                    const tip = document.querySelector('.success-tip, .success, .message-success, .ant-message-success');
-                    if (tip && tip.offsetParent !== null) return true;
-                    const btn = document.querySelector('i.post-submit-edit, i.post-submit');
-                    if (btn && btn.innerText.trim() === '编辑') return true;
-                    await wait(1000);
-                }
-                return false;
+                btn.disabled = false;
             }
         };
 
@@ -246,29 +296,43 @@
             discussRunning = false;
             return;
         }
-        console.log(`🎯 发现 ${topics.length} 个专题`);
 
-        for (let i = 0; i < topics.length; i++) {
-            const t = topics[i];
-            console.log(`\n📌 [${i+1}/${topics.length}] 处理专题: ${t.title}`);
+        const processedIds = getProcessedTopicIds();
+        const remainingTopics = topics.filter(t => !processedIds.includes(t.chapterId));
+
+        console.log(`🎯 总共 ${topics.length} 个专题，已完成 ${processedIds.length} 个，剩余 ${remainingTopics.length} 个`);
+
+        if (remainingTopics.length === 0) {
+            console.log('%c🎉 所有专题已处理完毕！', 'color:green;font-size:16px');
+            clearProcessedTopics();
+            GM_setValue(STATE_KEY, 'completed');
+            discussRunning = false;
+            return;
+        }
+
+        for (let i = 0; i < remainingTopics.length; i++) {
+            const t = remainingTopics[i];
+            console.log(`\n📌 [${processedIds.length + i + 1}/${topics.length}] 处理专题: ${t.title}`);
             switchToChapter(t.chapterId);
             await wait(4000);
 
-            const editBtn = document.querySelector('i.post-submit-edit');
-            if (editBtn && editBtn.innerText.trim() === '编辑') {
-                console.warn('  ⏭️ 该专题已提交过（检测到“编辑”按钮），跳过');
+            if (Editor.hasSubmitted()) {
+                console.warn('  ⏭️ 该专题已提交过，标记为已处理');
+                markTopicAsProcessed(t.chapterId);
                 continue;
             }
 
             const comment = Editor.getLongestComment();
             if (!comment) {
-                console.warn('  ⚠️ 未找到可复制评论，跳过');
+                console.warn('  ⚠️ 未找到可复制评论，跳过并标记');
+                markTopicAsProcessed(t.chapterId);
                 continue;
             }
             console.log(`  📋 复制评论 (${comment.length}字)`);
 
             if (!Editor.setContent(comment)) {
-                console.error('  ❌ 填充内容失败');
+                console.error('  ❌ 填充内容失败，跳过并标记');
+                markTopicAsProcessed(t.chapterId);
                 continue;
             }
             console.log('  ✅ 内容已填入');
@@ -276,19 +340,23 @@
 
             const btn = Editor.findReplyBtn();
             if (!btn) {
-                console.warn('  ❌ 未找到“回复”按钮，跳过');
+                console.warn('  ❌ 未找到“回复”按钮，跳过并标记');
+                markTopicAsProcessed(t.chapterId);
                 continue;
             }
             Editor.enableButton(btn);
-            console.log(`  🚀 点击提交`);
+            console.log(`  🚀 点击提交: ${btn.innerText}`);
             btn.click();
 
-            await Editor.waitForSuccess();
+            markTopicAsProcessed(t.chapterId);
+            console.log(`  💾 已标记专题 ${t.chapterId} 为已处理`);
+
             await wait(2000);
         }
 
         console.log('%c🎉🎉🎉 所有专题评论完成！刷新页面即可查看结果。 🎉🎉🎉', 'color:green;font-size:20px;background:#f0f0f0;padding:8px;border-radius:4px');
-        GM_deleteValue(STATE_KEY);
+        clearProcessedTopics();
+        GM_setValue(STATE_KEY, 'completed');
         discussRunning = false;
     }
 
@@ -296,9 +364,13 @@
     (async function main() {
         const step = GM_getValue(STATE_KEY, 'progress');
 
+        if (step === 'completed') {
+            console.log('%c✅ 所有任务已完成，脚本停止运行。如需重新开始，请手动清除存储。', 'color:green;font-size:14px');
+            return;
+        }
+
         console.log(`🔍 状态: ${step} | 课程页: ${isChapterPage} | 讨论页: ${isDiscussPage()}`);
 
-        // 优先课程页刷进度
         if (isChapterPage) {
             if (step === 'discuss') {
                 console.log('重置状态为进度模式');
@@ -308,7 +380,6 @@
             return;
         }
 
-        // 讨论页且状态为 discuss → 直接评论（也可能需要轮询）
         if (isDiscussPage() && step === 'discuss') {
             if (!discussRunning) {
                 await runDiscuss();
@@ -316,7 +387,6 @@
             return;
         }
 
-        // 讨论页但状态为 progress → 直接评论
         if (isDiscussPage() && step === 'progress') {
             console.log('已在讨论页，直接执行评论');
             GM_setValue(STATE_KEY, 'discuss');
@@ -326,7 +396,6 @@
             return;
         }
 
-        // 其他情况：如果状态是 discuss，启动轮询等待进入讨论区
         if (step === 'discuss') {
             startPollingForDiscuss();
             console.log('⏳ 等待进入讨论区...（将自动检测）');
